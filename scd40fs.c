@@ -8,17 +8,19 @@
 
 typedef struct Devfile Devfile;
 
-void	rend(Srv *);
-void	ropen(Req *r);
-void	rread(Req *r);
-void	initfs(char *dirname);
-int		initchip(void);
-void	closechip(void);
-char*	readall(Req *r);
-char*	readco₂(Req *r);
-char*	readtemp(Req *r);
-char*	readhumid(Req *r);
-
+static	void	rend(Srv *);
+static	void	ropen(Req *r);
+static	void	rread(Req *r);
+static	void	initfs(char *dirname);
+static	int		initchip(void);
+static	void	closechip(void);
+static	char*	readall(Req *r);
+static	char*	readascii(Req *r);
+static	char*	readco₂(Req *r);
+static	char*	readtemp(Req *r);
+static	char*	readhumid(Req *r);
+static	int		ruready(void);
+static	void	getfresh(void);
 
 
 struct Devfile {
@@ -30,6 +32,7 @@ struct Devfile {
 
 Devfile files[] = {
 	{ "all", readall, DMEXCL|0444 },
+	{ "ascii", readascii, DMEXCL|0444 },
 	{ "CO₂", readco₂, DMEXCL|0444 },
 	{ "tempC", readtemp, DMEXCL|0444 },
 	{ "RH", readhumid, DMEXCL|0444 },
@@ -46,23 +49,24 @@ Srv s = {
 File *root;
 File *devdir;
 int i²cfd;
+int lasttemp, lastco₂, lastrh;
 
 
-void
+static void
 rend(Srv *)
 {
 	closechip();
 }
 
 
-void
+static void
 ropen(Req *r)
 {
 	respond(r, nil);
 }
 
 
-void
+static void
 rread(Req *r)
 {
 	Devfile *f;
@@ -73,7 +77,7 @@ rread(Req *r)
 }
 
 
-void
+static void
 initfs(char *dirname)
 {
 	char* user;
@@ -92,16 +96,13 @@ initfs(char *dirname)
 }
 
 
-int
+static int
 initchip(void)
 {
 	int fd = -1;
 	uchar buf[2];
 
-	if(access("/dev/i2c.62.data", 0) != 0)
-		bind("#J62", "/dev", MBEFORE);
-
-	fd = open("/dev/i2c.62.data", ORDWR);
+	fd = open("/dev/i2c1/i2c.62.data", ORDWR);
 	if(fd < 0)
 		sysfatal("cant open file");
 
@@ -114,7 +115,7 @@ initchip(void)
 }
 
 
-void
+static void
 closechip(void)
 {
 	uchar buf[2];
@@ -128,19 +129,35 @@ closechip(void)
 }
 
 
-char*
-readall(Req *r)
+static int
+ruready(void)
+{
+	uchar reg[2];
+	uchar rsp[3];
+	u16int val;
+
+	reg[0] = 0xE4;
+	reg[1] = 0xB8;
+
+	pwrite(i²cfd, reg, 2, 0);
+	sleep(1);
+	pread(i²cfd, rsp, 3, 0);
+
+	val = (rsp[0] << 8) | rsp[1];
+
+	if((val &0xFFF) == 0)
+		return 0;
+
+	return 1;
+}
+
+
+static void
+getfresh(void)
 {
 	uchar reg[2];
 	uchar buf[9];
-	char out[256], *p;
-	int raw;
-	int co₂;
-	float tempc;
-	float rh;
-
-	memset(buf, 0, 9);
-	memset(out, 0, 256);
+	int rawtemp, rawco₂, rawrh;
 
 	reg[0] = 0xEC;
 	reg[1] = 0x05;
@@ -149,19 +166,28 @@ readall(Req *r)
 	sleep(1);
 	pread(i²cfd, buf, 9, 0);
 
-	raw = (buf[0] << 8) | buf[1];
-	co₂ = raw;
+	rawco₂ = (buf[0] << 8) | buf[1];
+	rawtemp = (buf[3] << 8) | buf[4];
+	rawrh = (buf[6] << 8) | buf[7];
 
-	raw = (buf[3] << 8) | buf[4];
-	tempc = -45 + (175 * (raw / pow(2, 16)));
+	lastco₂ = rawco₂;
+	lasttemp = (-45 + (175 * (rawtemp / pow(2, 16)))) * 10;
+	lastrh = (100 * (rawrh / pow(2, 16))) * 10;
+}
 
-	raw = (buf[7] << 8) | buf[8];
-	rh = 100 * (raw / pow(2, 16));
+
+static char*
+readall(Req *r)
+{
+	char out[256], *p;
+
+	if(ruready())
+		getfresh();
 
 	p = out;
-	p = seprint(p, out + sizeof out, "CO₂ = %dppm\n", co₂);
-	p = seprint(p, out + sizeof out, "Temp = %.1f°C\n", tempc);
-	p = seprint(p, out + sizeof out, "RH = %.1f%% \n", rh);
+	p = seprint(p, out + sizeof out, "CO₂ = %dppm\n", lastco₂);
+	p = seprint(p, out + sizeof out, "Temp = %d.%d°C\n", lasttemp/10, lasttemp%10);
+	p = seprint(p, out + sizeof out, "RH = %d.%d%% \n", lastrh/10, lastrh%10);
 	USED(p);
 
 	readstr(r, out);
@@ -169,88 +195,67 @@ readall(Req *r)
 }
 
 
-char*
+static char*
+readascii(Req *r)
+{
+	char out[256], *p;
+
+	if(ruready())
+		getfresh();
+
+	p = out;
+	p = seprint(p, out + sizeof out, "CO2 = %d ppm\n", lastco₂);
+	p = seprint(p, out + sizeof out, "Temp = %d.%d C\n", lasttemp/10, lasttemp%10);
+	p = seprint(p, out + sizeof out, "RH = %d.%d %% \n", lastrh/10, lastrh%10);
+	USED(p);
+
+	readstr(r, out);
+	return nil;
+}
+
+
+static char*
 readco₂(Req *r)
 {
-	uchar reg[2];
-	uchar buf[9];
 	char out[8], *p;
-	int co₂;
 
-	memset(buf, 0, 9);
-	memset(out, 0, 8);
-
-	reg[0] = 0xEC;
-	reg[1] = 0x05;
-
-	pwrite(i²cfd, reg, 2, 0);
-	sleep(1);
-	pread(i²cfd, buf, 9, 0);
-
-	co₂ = (buf[0] << 8) | buf[1];
+	if(ruready())
+		getfresh();
 
 	p = out;
-	p = seprint(p, out + sizeof out, "%d", co₂);
+	p = seprint(p, out + sizeof out, "%d", lastco₂);
 
 	readstr(r, out);
 	return nil;
 }
 
 
-char*
+static char*
 readtemp(Req *r)
 {
-	uchar reg[2];
-	uchar buf[9];
 	char out[8], *p;
-	int raw;
-	float temp;
 
-	memset(buf, 0, 9);
-	memset(out, 0, 8);
-
-	reg[0] = 0xEC;
-	reg[1] = 0x05;
-
-	pwrite(i²cfd, reg, 2, 0);
-	sleep(1);
-	pread(i²cfd, buf, 9, 0);
-
-	raw = (buf[3] << 8) | buf[4];
-	temp = -45 + (175 * (raw / pow(2, 16)));
+	if(ruready())
+		getfresh();
 
 	p = out;
-	p = seprint(p, out + sizeof out, "%.1f", temp);
+	p = seprint(p, out + sizeof out, "%d.%d", lasttemp/10, lasttemp%10);
 
 	readstr(r, out);
 	return nil;
 }
 
 
-char*
+static char*
 readhumid(Req *r)
 {
-	uchar reg[2];
-	uchar buf[9];
 	char out[8], *p;
-	int raw;
-	float rh;
 
-	memset(buf, 0, 9);
-	memset(out, 0, 8);
-
-	reg[0] = 0xEC;
-	reg[1] = 0x05;
-
-	pwrite(i²cfd, reg, 2, 0);
-	sleep(1);
-	pread(i²cfd, buf, 9, 0);
-
-	raw = (buf[7] << 8) | buf[8];
-	rh = 100 * (raw / pow(2, 16));
+	if(ruready())
+		getfresh();
 
 	p = out;
-	p = seprint(p, out + sizeof out, "%.1f", rh);
+	p = seprint(p, out + sizeof out, "%d.%d", lastrh/10, lastrh%10);
 
 	readstr(r, out);
 	return nil;
